@@ -3,15 +3,28 @@ pragma solidity 0.8.30;
 import "../src/CryptoBankV2.sol";
 import "forge-std/Test.sol";
 
+/**
+* @title CryptoBankV2Test
+* @notice Comprehensive test suite for CryptoBankBondingCurve contract
+* @dev Tests cover core banking operations including deposits, loans, repayments, and liquidations
+*/
 contract CryptoBankV2Test is Test {
+    // Contract instance and test addresses
     CryptoBankBondingCurve public bank;
     address public admin = address(1);
     address public user1 = address(2);
     address public user2 = address(3);
     
+    // System constants
     uint256 public constant MAX_CAPACITY = 100 ether;
     uint256 public constant MAX_LOAN_RATIO = 6000; // 60%
 
+    /**
+    * @notice Test setup routine
+    * @dev Initializes contract and funds test addresses
+    * - Deploys new CryptoBankBondingCurve contract
+    * - Funds admin and users with 100 ETH each
+    */
     function setUp() public {
         vm.deal(admin, 100 ether);
         vm.deal(user1, 100 ether);
@@ -21,35 +34,56 @@ contract CryptoBankV2Test is Test {
         bank = new CryptoBankBondingCurve();
     }
 
+    /**
+    * @notice Calculates required collateral for a loan amount
+    * @dev Uses bank's MAX_LTV_RATIO (50% LTV)
+    * @param loanAmount Desired loan amount in wei
+    * @return Required collateral amount in wei
+    */
     function calculateCollateral(uint256 loanAmount) internal view returns (uint256) {
         return (loanAmount * 1e4) / bank.MAX_LTV_RATIO();
     }
 
-    // Añadir función helper para depósitos
+    /**
+    * @notice Helper function for admin deposits
+    * @param amount ETH amount to deposit into the bank
+    */
     function _depositFunds(uint256 amount) internal {
         vm.prank(admin);
         bank.deposit{value: amount}();
     }
 
-    // Tests actualizados con depósitos iniciales
+    // --- Core Functionality Tests --- //
 
+    /**
+    * @notice Tests successful loan request with proper collateral
+    * @dev Sequence:
+    * 1. Admin deposits loan amount (ensures liquidity)
+    * 2. User requests loan with correct collateral
+    * 3. Verifies loan activation and parameters
+    */
     function test_RequestLoanWithCollateral() public {
         uint256 loanAmount = 10 ether;
         uint256 collateral = calculateCollateral(loanAmount);
         
-        _depositFunds(loanAmount); // Depósito inicial
+        _depositFunds(loanAmount); // Fund the bank
         
         vm.prank(user1);
         bank.requestLoan{value: collateral}(loanAmount);
     
         CryptoBankBondingCurve.Loan memory loan = bank.getLoanDetails(user1);
-        assertTrue(loan.active);
-        assertEq(loan.amount, loanAmount);
+        assertTrue(loan.active, "Loan should be active");
+        assertEq(loan.amount, loanAmount, "Loan amount mismatch");
     }
 
+    /**
+    * @notice Tests loan request rejection with insufficient collateral
+    * @dev Attempts loan with 1 wei less than required collateral
+    * Verifies contract reverts with correct error message
+    */
     function test_RequestLoanRevertIfInsufficientCollateral() public {
         uint256 loanAmount = 10 ether;
-        _depositFunds(loanAmount); // Depósito inicial
+        _depositFunds(loanAmount);
         
         uint256 insufficientCollateral = calculateCollateral(loanAmount) - 1 wei;
 
@@ -58,90 +92,126 @@ contract CryptoBankV2Test is Test {
         bank.requestLoan{value: insufficientCollateral}(loanAmount);
     }
 
+    /**
+    * @notice Tests full loan repayment with accrued interest
+    * @dev Sequence:
+    * 1. Deposit funds and create loan
+    * 2. Advance time by 30 days
+    * 3. Calculate expected interest
+    * 4. Repay loan and verify state updates
+    */
     function test_RepayLoanWithInterest() public {
-    uint256 loanAmount = 5 ether;
-    uint256 collateral = calculateCollateral(loanAmount);
-    
-    _depositFunds(loanAmount);
-    
-    vm.prank(user1);
-    bank.requestLoan{value: collateral}(loanAmount);
-    
-    // Obtener tasa de interés del préstamo
-    CryptoBankBondingCurve.Loan memory loan = bank.getLoanDetails(user1);
-    uint256 interestRate = loan.interestRate;
-    
-    vm.warp(block.timestamp + 30 days);
-    
-    // Calcular con la tasa real del préstamo
-    uint256 expectedInterest = (loanAmount * interestRate * 30 days) / (365 days * 10000);
-    uint256 repayment = loanAmount + expectedInterest;
-    
-    vm.prank(user1);
-    bank.repayLoan{value: repayment}();
-    
-    assertFalse(bank.getLoanDetails(user1).active);
-    assertEq(bank.totalLoans(), 0);
-}
-    function test_LiquidateOverdueLoan() public {
-        uint256 loanAmount = 10 ether;
+        uint256 loanAmount = 5 ether;
         uint256 collateral = calculateCollateral(loanAmount);
         
-        _depositFunds(loanAmount); // Depósito inicial
+        _depositFunds(loanAmount);
         
         vm.prank(user1);
         bank.requestLoan{value: collateral}(loanAmount);
         
+        // Get loan-specific interest rate
+        CryptoBankBondingCurve.Loan memory loan = bank.getLoanDetails(user1);
+        uint256 interestRate = loan.interestRate;
+        
+        // Simulate 30-day loan duration
+        vm.warp(block.timestamp + 30 days);
+        
+        // Calculate interest: (principal * rate * time) / (365 days * 10000)
+        uint256 expectedInterest = (loanAmount * interestRate * 30 days) / (365 days * 10000);
+        uint256 repayment = loanAmount + expectedInterest;
+        
+        vm.prank(user1);
+        bank.repayLoan{value: repayment}();
+        
+        assertFalse(bank.getLoanDetails(user1).active, "Loan should be closed");
+        assertEq(bank.totalLoans(), 0, "Total loans should reset");
+    }
+
+    /**
+    * @notice Tests liquidation of overdue loan
+    * @dev Sequence:
+    * 1. Create loan and advance time by 31 days
+    * 2. Execute liquidation as admin
+    * 3. Verify:
+    *    - Loan closure
+    *    - Collateral seizure (50%)
+    *    - System loan balance update
+    */
+    function test_LiquidateOverdueLoan() public {
+        uint256 loanAmount = 10 ether;
+        uint256 collateral = calculateCollateral(loanAmount);
+        
+        _depositFunds(loanAmount);
+        
+        vm.prank(user1);
+        bank.requestLoan{value: collateral}(loanAmount);
+        
+        // Make loan overdue (+31 days)
         vm.warp(block.timestamp + 31 days);
         
         vm.prank(admin);
         bank.liquidate(user1);
         
         CryptoBankBondingCurve.Loan memory loan = bank.getLoanDetails(user1);
-        assertFalse(loan.active);
-        assertEq(bank.totalLoans(), 0);
+        assertFalse(loan.active, "Loan should be closed");
+        assertEq(bank.totalLoans(), 0, "Total loans should reset");
     }
 
+    /**
+    * @notice Tests interest calculation accuracy and event emission
+    * @dev Verifies:
+    * 1. Correct interest calculation for 15-day period
+    * 2. Proper LoanRepaid event emission
+    */
     function test_InterestCalculation() public {
         uint256 loanAmount = 10 ether;
         uint256 collateral = calculateCollateral(loanAmount);
         
-        _depositFunds(loanAmount); // Depósito inicial
+        _depositFunds(loanAmount);
         
         vm.prank(user1);
         bank.requestLoan{value: collateral}(loanAmount);
     
+        // Simulate 15-day duration
         vm.warp(block.timestamp + 15 days);
     
         CryptoBankBondingCurve.Loan memory loan = bank.getLoanDetails(user1);
         uint256 expectedInterest = (loanAmount * loan.interestRate * 15 days) / (365 days * 10000);
         
+        // Verify event emission with exact parameters
         vm.prank(user1);
         vm.expectEmit(true, true, true, true);
         emit CryptoBankBondingCurve.LoanRepaid(user1, loanAmount, expectedInterest);
         bank.repayLoan{value: loanAmount + expectedInterest}();
     }
 
+    /**
+    * @notice Tests collateral return logic after repayment
+    * @dev Verifies:
+    * 1. Correct balance changes after loan lifecycle
+    * 2. Proper collateral return
+    * 3. Interest deduction accuracy
+    */
     function test_CollateralReturnAfterRepayment() public {
-    uint256 loanAmount = 2 ether;
-    uint256 collateral = calculateCollateral(loanAmount);
-    
-    _depositFunds(loanAmount);
-    
-    uint256 initialBalance = user1.balance;
+        uint256 loanAmount = 2 ether;
+        uint256 collateral = calculateCollateral(loanAmount);
+        
+        _depositFunds(loanAmount);
+        
+        uint256 initialBalance = user1.balance;
 
-    vm.prank(user1);
-    bank.requestLoan{value: collateral}(loanAmount);
-    
-    // Calcular interés real en lugar de usar valor fijo
-    vm.warp(block.timestamp + 1 days);
-    CryptoBankBondingCurve.Loan memory loan = bank.getLoanDetails(user1);
-    uint256 interest = (loanAmount * loan.interestRate * 1 days) / (365 days * 10000);
-    
-    vm.prank(user1);
-    bank.repayLoan{value: loanAmount + interest}();
-    
-    // Balance final = inicial - colateral - interés + colateral devuelto
-    assertEq(user1.balance, initialBalance - interest);
-}
+        vm.prank(user1);
+        bank.requestLoan{value: collateral}(loanAmount);
+        
+        // Calculate actual interest for 1 day
+        vm.warp(block.timestamp + 1 days);
+        CryptoBankBondingCurve.Loan memory loan = bank.getLoanDetails(user1);
+        uint256 interest = (loanAmount * loan.interestRate * 1 days) / (365 days * 10000);
+        
+        vm.prank(user1);
+        bank.repayLoan{value: loanAmount + interest}();
+        
+        // Final balance = initial - interest (collateral is returned)
+        assertEq(user1.balance, initialBalance - interest, "Balance mismatch");
+    }
 }
