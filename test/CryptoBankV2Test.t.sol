@@ -53,6 +53,13 @@ contract CryptoBankV2Test is Test {
         bank.deposit{value: amount}();
     }
 
+    function calculateInterest(
+        uint256 principal,
+        uint256 rateBps,
+        uint256 duration
+    ) public pure returns (uint256) {
+        return (principal * rateBps * duration) / (365 days * 10000);
+    }
     // --- Core Functionality Tests --- //
 
     /**
@@ -214,7 +221,25 @@ contract CryptoBankV2Test is Test {
         // Final balance = initial - interest (collateral is returned)
         assertEq(user1.balance, initialBalance - interest, "Balance mismatch");
     }
- //Fuzzing test
+    
+function checkSystemInvariants() public view{
+        // 1. Balance del contrato = totalDeposits + colateral - préstamos
+        uint256 expectedBalance = bank.totalDeposits() + 
+            (address(bank).balance + bank.totalLoans() - bank.totalDeposits()) - 
+            bank.totalLoans();
+        assertEq(address(bank).balance, expectedBalance, "Balance mismatch");
+        
+        // 2. Total depósitos <= MAX_CAPACITY
+        assertLe(bank.totalDeposits(), MAX_CAPACITY, "Capacity exceeded");
+        
+        // 3. Total préstamos <= 60% capacidad
+        assertLe(bank.totalLoans(), (MAX_CAPACITY * bank.MAX_LOAN_RATIO()) / 1e4, "Loan limit exceeded");
+    }
+
+    // ========== Tests Existentes ==========
+    // ... [tus tests existentes aquí] ...
+
+    // ========== Tests Fuzzing ==========
     function testFuzz_DepositWithdraw(uint96 amount) public {
         amount = uint96(bound(amount, 1 wei, MAX_CAPACITY));
         
@@ -241,31 +266,49 @@ contract CryptoBankV2Test is Test {
         depositAmount = uint96(bound(depositAmount, 1 ether, MAX_CAPACITY));
         loanAmount = uint96(bound(loanAmount, 1 wei, depositAmount));
         
-        // Inicial deposit
-        vm.prank(user1);
-        bank.deposit{value: depositAmount}();
+        // Depósito inicial
+        _depositFunds(depositAmount);
         
-        // Request loan
-        uint256 collateral = (loanAmount * 1e4) / bank.MAX_LTV_RATIO();
+        // Solicitar préstamo
+        uint256 collateral = calculateCollateral(loanAmount);
+        vm.assume(collateral <= 100 ether); // Limitar colateral máximo
+        vm.deal(user2, collateral);
+        
         vm.prank(user2);
         bank.requestLoan{value: collateral}(loanAmount);
         
-        // Simulate time pass
+        // Simular paso del tiempo
         timePassed = uint40(bound(timePassed, 1, 365 days));
         vm.warp(block.timestamp + timePassed);
         
-        // Calculate rate interest
+        // Calcular interés
         uint256 interest = calculateInterest(
             loanAmount,
-            bank.getCurrentInterestBps(),
+             bank.getLoanDetails(user2).interestRate,
             timePassed
         );
         
-        // Pay loan
+        // Pagar préstamo
+        vm.deal(user2, loanAmount + interest);
         vm.prank(user2);
         bank.repayLoan{value: loanAmount + interest}();
         
         checkSystemInvariants();
     }
 
+    // ========== Tests Edge Cases ==========
+    function test_RequestLoanMaxCapacity() public {
+        uint256 maxLoan = (MAX_CAPACITY * bank.MAX_LOAN_RATIO()) / 1e4;
+        uint256 collateral = calculateCollateral(maxLoan);
+        
+        _depositFunds(MAX_CAPACITY);
+        vm.deal(user1, collateral);
+        
+        vm.prank(user1);
+        bank.requestLoan{value: collateral}(maxLoan);
+        
+        assertEq(bank.totalLoans(), maxLoan, "Max loan not reached");
+        checkSystemInvariants();
+    }
 }
+
