@@ -214,4 +214,58 @@ contract CryptoBankV2Test is Test {
         // Final balance = initial - interest (collateral is returned)
         assertEq(user1.balance, initialBalance - interest, "Balance mismatch");
     }
+ //Fuzzing test
+    function testFuzz_DepositWithdraw(uint96 amount) public {
+        amount = uint96(bound(amount, 1 wei, MAX_CAPACITY));
+        
+        vm.prank(user1);
+        bank.deposit{value: amount}();
+        
+        assertEq(bank.userBalances(user1), amount, "Deposit failed");
+        assertEq(bank.totalDeposits(), amount, "Total deposits mismatch");
+        
+        vm.prank(user1);
+        bank.withdraw(amount);
+        
+        assertEq(bank.userBalances(user1), 0, "Withdraw failed");
+        assertEq(bank.totalDeposits(), 0, "Total deposits not zero");
+        
+        checkSystemInvariants();
+    }
+
+    function testFuzz_LoanLifecycle(
+        uint96 depositAmount,
+        uint96 loanAmount,
+        uint40 timePassed
+    ) public {
+        depositAmount = uint96(bound(depositAmount, 1 ether, MAX_CAPACITY));
+        loanAmount = uint96(bound(loanAmount, 1 wei, depositAmount));
+        
+        // Inicial deposit
+        vm.prank(user1);
+        bank.deposit{value: depositAmount}();
+        
+        // Request loan
+        uint256 collateral = (loanAmount * 1e4) / bank.MAX_LTV_RATIO();
+        vm.prank(user2);
+        bank.requestLoan{value: collateral}(loanAmount);
+        
+        // Simulate time pass
+        timePassed = uint40(bound(timePassed, 1, 365 days));
+        vm.warp(block.timestamp + timePassed);
+        
+        // Calculate rate interest
+        uint256 interest = calculateInterest(
+            loanAmount,
+            bank.getCurrentInterestBps(),
+            timePassed
+        );
+        
+        // Pay loan
+        vm.prank(user2);
+        bank.repayLoan{value: loanAmount + interest}();
+        
+        checkSystemInvariants();
+    }
+
 }
